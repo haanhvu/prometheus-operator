@@ -1074,6 +1074,241 @@ func (cg *ConfigGenerator) generatePodMonitorConfig(
 	return cfg
 }
 
+func (cg *ConfigGenerator) generatePodMonitorConfigForDaemonSet(
+	m *monitoringv1.PodMonitor,
+	ep monitoringv1.PodMetricsEndpoint,
+	i int, apiserverConfig *monitoringv1.APIServerConfig,
+	store *assets.StoreBuilder,
+) yaml.MapSlice {
+	scrapeClass := cg.getScrapeClassOrDefault(m.Spec.ScrapeClassName)
+
+	cfg := yaml.MapSlice{
+		{
+			Key:   "job_name",
+			Value: fmt.Sprintf("podMonitor/%s/%s/%d", m.Namespace, m.Name, i),
+		},
+	}
+	cfg = cg.AddHonorLabels(cfg, ep.HonorLabels)
+	cfg = cg.AddHonorTimestamps(cfg, ep.HonorTimestamps)
+	cfg = cg.AddTrackTimestampsStaleness(cfg, ep.TrackTimestampsStaleness)
+
+	var attachMetaConfig *attachMetadataConfig
+	if m.Spec.AttachMetadata != nil {
+		attachMetaConfig = &attachMetadataConfig{
+			MinimumVersion: "2.35.0",
+			AttachMetadata: m.Spec.AttachMetadata,
+		}
+	}
+
+	cfg = append(cfg, cg.generateK8SSDConfig(m.Spec.NamespaceSelector, m.Namespace, apiserverConfig, store, kubernetesSDRolePod, attachMetaConfig))
+
+	if ep.Interval != "" {
+		cfg = append(cfg, yaml.MapItem{Key: "scrape_interval", Value: ep.Interval})
+	}
+	if ep.ScrapeTimeout != "" {
+		cfg = append(cfg, yaml.MapItem{Key: "scrape_timeout", Value: ep.ScrapeTimeout})
+	}
+	if ep.Path != "" {
+		cfg = append(cfg, yaml.MapItem{Key: "metrics_path", Value: ep.Path})
+	}
+	if ep.ProxyURL != nil {
+		cfg = append(cfg, yaml.MapItem{Key: "proxy_url", Value: ep.ProxyURL})
+	}
+	if ep.Params != nil {
+		cfg = append(cfg, yaml.MapItem{Key: "params", Value: ep.Params})
+	}
+	if ep.Scheme != "" {
+		cfg = append(cfg, yaml.MapItem{Key: "scheme", Value: ep.Scheme})
+	}
+	if ep.FollowRedirects != nil {
+		cfg = cg.WithMinimumVersion("2.26.0").AppendMapItem(cfg, "follow_redirects", *ep.FollowRedirects)
+	}
+	if ep.EnableHttp2 != nil {
+		cfg = cg.WithMinimumVersion("2.35.0").AppendMapItem(cfg, "enable_http2", *ep.EnableHttp2)
+	}
+
+	cfg = addTLStoYaml(cfg, m.Namespace, mergeSafeTLSConfigWithScrapeClass(ep.TLSConfig, scrapeClass))
+
+	//nolint:staticcheck // Ignore SA1019 this field is marked as deprecated.
+	if ep.BearerTokenSecret.Name != "" {
+		level.Debug(cg.logger).Log("msg", "'bearerTokenSecret' is deprecated, use 'authorization' instead.")
+		if s, ok := store.TokenAssets[fmt.Sprintf("podMonitor/%s/%s/%d", m.Namespace, m.Name, i)]; ok {
+			cfg = append(cfg, yaml.MapItem{Key: "bearer_token", Value: s})
+		}
+	}
+
+	s := store.ForNamespace(m.Namespace)
+	cfg = cg.addBasicAuthToYaml(cfg, s, ep.BasicAuth)
+	cfg = cg.addOAuth2ToYaml(cfg, s, ep.OAuth2)
+
+	cfg = cg.addSafeAuthorizationToYaml(cfg, fmt.Sprintf("podMonitor/auth/%s/%s/%d", m.Namespace, m.Name, i), store, ep.Authorization)
+
+	relabelings := initRelabelings()
+
+	if ep.FilterRunning == nil || *ep.FilterRunning {
+		relabelings = append(relabelings, generateRunningFilter())
+	}
+
+	var labelKeys []string
+	// Filter targets by pods selected by the monitor.
+	// Exact label matches.
+	for k := range m.Spec.Selector.MatchLabels {
+		labelKeys = append(labelKeys, k)
+	}
+	sort.Strings(labelKeys)
+
+	for _, k := range labelKeys {
+		relabelings = append(relabelings, yaml.MapSlice{
+			{Key: "action", Value: "keep"},
+			{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_label_" + sanitizeLabelName(k), "__meta_kubernetes_pod_labelpresent_" + sanitizeLabelName(k)}},
+			{Key: "regex", Value: fmt.Sprintf("(%s);true", m.Spec.Selector.MatchLabels[k])},
+		})
+	}
+	// Set based label matching. We have to map the valid relations
+	// `In`, `NotIn`, `Exists`, and `DoesNotExist`, into relabeling rules.
+	for _, exp := range m.Spec.Selector.MatchExpressions {
+		switch exp.Operator {
+		case metav1.LabelSelectorOpIn:
+			relabelings = append(relabelings, yaml.MapSlice{
+				{Key: "action", Value: "keep"},
+				{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_label_" + sanitizeLabelName(exp.Key), "__meta_kubernetes_pod_labelpresent_" + sanitizeLabelName(exp.Key)}},
+				{Key: "regex", Value: fmt.Sprintf("(%s);true", strings.Join(exp.Values, "|"))},
+			})
+		case metav1.LabelSelectorOpNotIn:
+			relabelings = append(relabelings, yaml.MapSlice{
+				{Key: "action", Value: "drop"},
+				{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_label_" + sanitizeLabelName(exp.Key), "__meta_kubernetes_pod_labelpresent_" + sanitizeLabelName(exp.Key)}},
+				{Key: "regex", Value: fmt.Sprintf("(%s);true", strings.Join(exp.Values, "|"))},
+			})
+		case metav1.LabelSelectorOpExists:
+			relabelings = append(relabelings, yaml.MapSlice{
+				{Key: "action", Value: "keep"},
+				{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_labelpresent_" + sanitizeLabelName(exp.Key)}},
+				{Key: "regex", Value: "true"},
+			})
+		case metav1.LabelSelectorOpDoesNotExist:
+			relabelings = append(relabelings, yaml.MapSlice{
+				{Key: "action", Value: "drop"},
+				{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_labelpresent_" + sanitizeLabelName(exp.Key)}},
+				{Key: "regex", Value: "true"},
+			})
+		}
+	}
+
+	// Filter targets based on correct port for the endpoint.
+	if ep.Port != "" {
+		relabelings = append(relabelings, yaml.MapSlice{
+			{Key: "action", Value: "keep"},
+			{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_container_port_name"}},
+			{Key: "regex", Value: ep.Port},
+		})
+	} else if ep.TargetPort != nil { //nolint:staticcheck // Ignore SA1019 this field is marked as deprecated.
+		level.Warn(cg.logger).Log("msg", "'targetPort' is deprecated, use 'port' instead.")
+		//nolint:staticcheck // Ignore SA1019 this field is marked as deprecated.
+		if ep.TargetPort.StrVal != "" {
+			relabelings = append(relabelings, yaml.MapSlice{
+				{Key: "action", Value: "keep"},
+				{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_container_port_name"}},
+				{Key: "regex", Value: ep.TargetPort.String()},
+			})
+		} else if ep.TargetPort.IntVal != 0 { //nolint:staticcheck // Ignore SA1019 this field is marked as deprecated.
+			relabelings = append(relabelings, yaml.MapSlice{
+				{Key: "action", Value: "keep"},
+				{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_container_port_number"}},
+				{Key: "regex", Value: ep.TargetPort.String()},
+			})
+		}
+	}
+
+	// Relabel namespace and pod and service labels into proper labels.
+	relabelings = append(relabelings, []yaml.MapSlice{
+		{
+			{Key: "source_labels", Value: []string{"__meta_kubernetes_namespace"}},
+			{Key: "target_label", Value: "namespace"},
+		},
+		{
+			{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_container_name"}},
+			{Key: "target_label", Value: "container"},
+		},
+		{
+			{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_name"}},
+			{Key: "target_label", Value: "pod"},
+		},
+	}...)
+
+	// Relabel targetLabels from Pod onto target.
+	cpf := cg.prom.GetCommonPrometheusFields()
+	for _, l := range append(m.Spec.PodTargetLabels, cpf.PodTargetLabels...) {
+		relabelings = append(relabelings, yaml.MapSlice{
+			{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_label_" + sanitizeLabelName(l)}},
+			{Key: "target_label", Value: sanitizeLabelName(l)},
+			{Key: "regex", Value: "(.+)"},
+			{Key: "replacement", Value: "${1}"},
+		})
+	}
+
+	// By default, generate a safe job name from the PodMonitor. We also keep
+	// this around if a jobLabel is set in case the targets don't actually have a
+	// value for it. A single pod may potentially have multiple metrics
+	// endpoints, therefore the endpoints labels is filled with the ports name or
+	// as a fallback the port number.
+
+	relabelings = append(relabelings, yaml.MapSlice{
+		{Key: "target_label", Value: "job"},
+		{Key: "replacement", Value: fmt.Sprintf("%s/%s", m.GetNamespace(), m.GetName())},
+	})
+	if m.Spec.JobLabel != "" {
+		relabelings = append(relabelings, yaml.MapSlice{
+			{Key: "source_labels", Value: []string{"__meta_kubernetes_pod_label_" + sanitizeLabelName(m.Spec.JobLabel)}},
+			{Key: "target_label", Value: "job"},
+			{Key: "regex", Value: "(.+)"},
+			{Key: "replacement", Value: "${1}"},
+		})
+	}
+
+	if ep.Port != "" {
+		relabelings = append(relabelings, yaml.MapSlice{
+			{Key: "target_label", Value: "endpoint"},
+			{Key: "replacement", Value: ep.Port},
+		})
+	} else if ep.TargetPort != nil && ep.TargetPort.String() != "" { //nolint:staticcheck // Ignore SA1019 this field is marked as deprecated.
+		relabelings = append(relabelings, yaml.MapSlice{
+			{Key: "target_label", Value: "endpoint"},
+			{Key: "replacement", Value: ep.TargetPort.String()}, //nolint:staticcheck // Ignore SA1019 this field is marked as deprecated.
+		})
+	}
+
+	// Add scrape class relabelings if there is any.
+	relabelings = append(relabelings, generateRelabelConfig(scrapeClass.Relabelings)...)
+
+	labeler := namespacelabeler.New(cpf.EnforcedNamespaceLabel, cpf.ExcludedFromEnforcement, false)
+	relabelings = append(relabelings, generateRelabelConfig(labeler.GetRelabelingConfigs(m.TypeMeta, m.ObjectMeta, ep.RelabelConfigs))...)
+
+	cfg = append(cfg, yaml.MapItem{Key: "relabel_configs", Value: relabelings})
+
+	cfg = cg.AddLimitsToYAML(cfg, sampleLimitKey, m.Spec.SampleLimit, cpf.EnforcedSampleLimit)
+	cfg = cg.AddLimitsToYAML(cfg, targetLimitKey, m.Spec.TargetLimit, cpf.EnforcedTargetLimit)
+	cfg = cg.AddLimitsToYAML(cfg, labelLimitKey, m.Spec.LabelLimit, cpf.EnforcedLabelLimit)
+	cfg = cg.AddLimitsToYAML(cfg, labelNameLengthLimitKey, m.Spec.LabelNameLengthLimit, cpf.EnforcedLabelNameLengthLimit)
+	cfg = cg.AddLimitsToYAML(cfg, labelValueLengthLimitKey, m.Spec.LabelValueLengthLimit, cpf.EnforcedLabelValueLengthLimit)
+	cfg = cg.AddLimitsToYAML(cfg, keepDroppedTargetsKey, m.Spec.KeepDroppedTargets, cpf.EnforcedKeepDroppedTargets)
+	cfg = cg.AddScrapeProtocols(cfg, m.Spec.ScrapeProtocols)
+
+	if bodySizeLimit := getLowerByteSize(m.Spec.BodySizeLimit, &cpf); !isByteSizeEmpty(bodySizeLimit) {
+		cfg = cg.WithMinimumVersion("2.28.0").AppendMapItem(cfg, "body_size_limit", bodySizeLimit)
+	}
+
+	metricRelabelings := []monitoringv1.RelabelConfig{}
+	metricRelabelings = append(metricRelabelings, scrapeClass.MetricRelabelings...)
+	metricRelabelings = append(metricRelabelings, labeler.GetRelabelingConfigs(m.TypeMeta, m.ObjectMeta, ep.MetricRelabelConfigs)...)
+
+	if len(metricRelabelings) > 0 {
+		cfg = append(cfg, yaml.MapItem{Key: "metric_relabel_configs", Value: generateRelabelConfig(metricRelabelings)})
+	}
+
+	return cfg
+}
+
 // generateProbeConfig builds the prometheus configuration for a probe. This function
 // assumes that it will never receive a probe with empty targets, since the
 // operator filters those in the validation step in SelectProbes().
@@ -1916,6 +2151,45 @@ func (cg *ConfigGenerator) generateAdditionalScrapeConfigs(
 	return addlScrapeConfigs, nil
 }
 
+func (cg *ConfigGenerator) generateAdditionalScrapeConfigsForDaemonSet(
+	additionalScrapeConfigs []byte,
+) ([]yaml.MapSlice, error) {
+	var additionalScrapeConfigsYaml []yaml.MapSlice
+	err := yaml.Unmarshal(additionalScrapeConfigs, &additionalScrapeConfigsYaml)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshalling additional scrape configs failed: %w", err)
+	}
+
+	var addlScrapeConfigs []yaml.MapSlice
+	for _, mapSlice := range additionalScrapeConfigsYaml {
+		var addlScrapeConfig yaml.MapSlice
+		var relabelings []yaml.MapSlice
+		var otherConfigItems []yaml.MapItem
+
+		for _, mapItem := range mapSlice {
+			if mapItem.Key != "relabel_configs" {
+				otherConfigItems = append(otherConfigItems, mapItem)
+				continue
+			}
+			values, ok := mapItem.Value.([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("error parsing relabel configs: %w", err)
+			}
+			for _, value := range values {
+				relabeling, ok := value.(yaml.MapSlice)
+				if !ok {
+					return nil, fmt.Errorf("error parsing relabel config: %w", err)
+				}
+				relabelings = append(relabelings, relabeling)
+			}
+		}
+		addlScrapeConfig = append(addlScrapeConfig, otherConfigItems...)
+		addlScrapeConfig = append(addlScrapeConfig, yaml.MapItem{Key: "relabel_configs", Value: relabelings})
+		addlScrapeConfigs = append(addlScrapeConfigs, addlScrapeConfig)
+	}
+	return addlScrapeConfigs, nil
+}
+
 func (cg *ConfigGenerator) generateRemoteReadConfig(
 	remoteRead []monitoringv1.RemoteReadSpec,
 	store *assets.StoreBuilder,
@@ -2381,6 +2655,36 @@ func (cg *ConfigGenerator) appendPodMonitorConfigs(
 	return slices
 }
 
+func (cg *ConfigGenerator) appendPodMonitorConfigsForDaemonSet(
+	slices []yaml.MapSlice,
+	podMonitors map[string]*monitoringv1.PodMonitor,
+	apiserverConfig *monitoringv1.APIServerConfig,
+	store *assets.StoreBuilder) []yaml.MapSlice {
+	pMonIdentifiers := make([]string, len(podMonitors))
+	i := 0
+	for k := range podMonitors {
+		pMonIdentifiers[i] = k
+		i++
+	}
+
+	// Sorting ensures, that we always generate the config in the same order.
+	sort.Strings(pMonIdentifiers)
+
+	for _, identifier := range pMonIdentifiers {
+		for i, ep := range podMonitors[identifier].Spec.PodMetricsEndpoints {
+			slices = append(slices,
+				cg.WithKeyVals("pod_monitor", identifier).generatePodMonitorConfigForDaemonSet(
+					podMonitors[identifier], ep, i,
+					apiserverConfig,
+					store,
+				),
+			)
+		}
+	}
+
+	return slices
+}
+
 func (cg *ConfigGenerator) appendProbeConfigs(
 	slices []yaml.MapSlice,
 	probes map[string]*monitoringv1.Probe,
@@ -2413,6 +2717,15 @@ func (cg *ConfigGenerator) appendProbeConfigs(
 
 func (cg *ConfigGenerator) appendAdditionalScrapeConfigs(scrapeConfigs []yaml.MapSlice, additionalScrapeConfigs []byte, shards int32) ([]yaml.MapSlice, error) {
 	addlScrapeConfigs, err := cg.generateAdditionalScrapeConfigs(additionalScrapeConfigs, shards)
+	if err != nil {
+		return nil, err
+	}
+
+	return append(scrapeConfigs, addlScrapeConfigs...), nil
+}
+
+func (cg *ConfigGenerator) appendAdditionalScrapeConfigsForDaemonSet(scrapeConfigs []yaml.MapSlice, additionalScrapeConfigs []byte) ([]yaml.MapSlice, error) {
+	addlScrapeConfigs, err := cg.generateAdditionalScrapeConfigsForDaemonSet(additionalScrapeConfigs)
 	if err != nil {
 		return nil, err
 	}
@@ -2464,6 +2777,65 @@ func (cg *ConfigGenerator) GenerateAgentConfiguration(
 	}
 
 	scrapeConfigs, err = cg.appendAdditionalScrapeConfigs(scrapeConfigs, additionalScrapeConfigs, shards)
+	if err != nil {
+		return nil, fmt.Errorf("generate additional scrape configs: %w", err)
+	}
+	cfg = append(cfg, yaml.MapItem{
+		Key:   "scrape_configs",
+		Value: scrapeConfigs,
+	})
+
+	// Remote write config
+	if len(cpf.RemoteWrite) > 0 {
+		cfg = append(cfg, cg.generateRemoteWriteConfig(store))
+	}
+
+	if cpf.TracingConfig != nil {
+		tracingcfg, err := cg.generateTracingConfig()
+		if err != nil {
+			return nil, fmt.Errorf("generating tracing configuration failed: %w", err)
+		}
+
+		cfg = append(cfg, tracingcfg)
+	}
+
+	return yaml.Marshal(cfg)
+}
+
+// GenerateAgentConfiguration creates a serialized YAML representation of a Prometheus Agent configuration using the provided resources.
+func (cg *ConfigGenerator) GenerateAgentDaemonSetConfiguration(
+	ctx context.Context,
+	pMons map[string]*monitoringv1.PodMonitor,
+	store *assets.StoreBuilder,
+	additionalScrapeConfigs []byte,
+) ([]byte, error) {
+	cpf := cg.prom.GetCommonPrometheusFields()
+
+	// validates the value of scrapeTimeout based on scrapeInterval
+	if cpf.ScrapeTimeout != "" {
+		if err := CompareScrapeTimeoutToScrapeInterval(cpf.ScrapeTimeout, cpf.ScrapeInterval); err != nil {
+			return nil, err
+		}
+	}
+
+	// Global config
+	cfg := yaml.MapSlice{}
+	globalItems := yaml.MapSlice{}
+	globalItems = cg.appendScrapeIntervals(globalItems)
+	globalItems = cg.appendScrapeProtocols(globalItems)
+	globalItems = cg.appendExternalLabels(globalItems)
+	globalItems = cg.appendScrapeLimits(globalItems)
+	cfg = append(cfg, yaml.MapItem{Key: "global", Value: globalItems})
+
+	// Scrape config
+	var (
+		scrapeConfigs   []yaml.MapSlice
+		apiserverConfig = cpf.APIServerConfig
+	)
+
+	scrapeConfigs = cg.appendPodMonitorConfigsForDaemonSet(scrapeConfigs, pMons, apiserverConfig, store)
+
+	scrapeConfigs, err := cg.appendAdditionalScrapeConfigsForDaemonSet(scrapeConfigs, additionalScrapeConfigs)
 	if err != nil {
 		return nil, fmt.Errorf("generate additional scrape configs: %w", err)
 	}

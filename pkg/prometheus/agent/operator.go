@@ -714,6 +714,186 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 	return nil
 }
 
+func (c *Operator) syncDaemonSet(ctx context.Context, key string) error {
+	pobj, err := c.promInfs.Get(key)
+
+	if apierrors.IsNotFound(err) {
+		c.reconciliations.ForgetObject(key)
+		// Dependent resources are cleaned up by K8s via OwnerReferences
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	p := pobj.(*monitoringv1alpha1.PrometheusAgent)
+	p = p.DeepCopy()
+	if err := k8sutil.AddTypeInformationToObject(p); err != nil {
+		return fmt.Errorf("failed to set Prometheus type information: %w", err)
+	}
+
+	logger := log.With(c.logger, "key", key)
+
+	// Check if the Agent instance is marked for deletion.
+	if c.rr.DeletionInProgress(p) {
+		return nil
+	}
+
+	if p.Spec.Paused {
+		level.Info(logger).Log("msg", "the resource is paused, not reconciling")
+		return nil
+	}
+
+	level.Info(logger).Log("msg", "sync prometheus")
+
+	cg, err := prompkg.NewConfigGenerator(c.logger, p, c.endpointSliceSupported)
+	if err != nil {
+		return err
+	}
+
+	assetStore := assets.NewStoreBuilder(c.kclient.CoreV1(), c.kclient.CoreV1())
+	if err := c.createOrUpdateConfigurationSecret(ctx, p, cg, assetStore); err != nil {
+		return fmt.Errorf("creating config failed: %w", err)
+	}
+
+	tlsAssets, err := operator.ReconcileShardedSecretForTLSAssets(ctx, assetStore, c.kclient, prompkg.NewTLSAssetSecret(p, c.config))
+	if err != nil {
+		return fmt.Errorf("failed to reconcile the TLS secrets: %w", err)
+	}
+
+	if err := c.createOrUpdateWebConfigSecret(ctx, p); err != nil {
+		return fmt.Errorf("synchronizing web config secret failed: %w", err)
+	}
+
+	// Create governing service if it doesn't exist.
+	svcClient := c.kclient.CoreV1().Services(p.Namespace)
+	if err := k8sutil.CreateOrUpdateService(ctx, svcClient, makeStatefulSetService(p, c.config)); err != nil {
+		return fmt.Errorf("synchronizing governing service failed: %w", err)
+	}
+
+	ssetClient := c.kclient.AppsV1().StatefulSets(p.Namespace) //here downward
+
+	// Ensure we have a StatefulSet running Prometheus Agent deployed and that StatefulSet names are created correctly.
+	expected := prompkg.ExpectedStatefulSetShardNames(p)
+	for shard, ssetName := range expected {
+		logger := log.With(logger, "statefulset", ssetName, "shard", fmt.Sprintf("%d", shard))
+		level.Debug(logger).Log("msg", "reconciling statefulset")
+
+		obj, err := c.ssetInfs.Get(prompkg.KeyToStatefulSetKey(p, key, shard))
+		exists := !apierrors.IsNotFound(err)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("retrieving statefulset failed: %w", err)
+		}
+
+		existingStatefulSet := &appsv1.StatefulSet{}
+		if obj != nil {
+			existingStatefulSet = obj.(*appsv1.StatefulSet)
+			if c.rr.DeletionInProgress(existingStatefulSet) {
+				// We want to avoid entering a hot-loop of update/delete cycles
+				// here since the sts was marked for deletion in foreground,
+				// which means it may take some time before the finalizers
+				// complete and the resource disappears from the API. The
+				// deletion timestamp will have been set when the initial
+				// delete request was issued. In that case, we avoid further
+				// processing.
+				continue
+			}
+		}
+
+		newSSetInputHash, err := createSSetInputHash(*p, c.config, tlsAssets, existingStatefulSet.Spec)
+		if err != nil {
+			return err
+		}
+
+		sset, err := makeStatefulSet(
+			ssetName,
+			p,
+			&c.config,
+			cg,
+			newSSetInputHash,
+			int32(shard),
+			tlsAssets)
+		if err != nil {
+			return fmt.Errorf("making statefulset failed: %w", err)
+		}
+		operator.SanitizeSTS(sset)
+
+		if !exists {
+			level.Debug(logger).Log("msg", "no current statefulset found")
+			level.Debug(logger).Log("msg", "creating statefulset")
+			if _, err := ssetClient.Create(ctx, sset, metav1.CreateOptions{}); err != nil {
+				return fmt.Errorf("creating statefulset failed: %w", err)
+			}
+			continue
+		}
+
+		if newSSetInputHash == existingStatefulSet.ObjectMeta.Annotations[prompkg.SSetInputHashName] {
+			level.Debug(logger).Log("msg", "new statefulset generation inputs match current, skipping any actions")
+			continue
+		}
+
+		level.Debug(logger).Log(
+			"msg", "updating current statefulset because of hash divergence",
+			"new_hash", newSSetInputHash,
+			"existing_hash", existingStatefulSet.ObjectMeta.Annotations[prompkg.SSetInputHashName],
+		)
+
+		err = k8sutil.UpdateStatefulSet(ctx, ssetClient, sset)
+		sErr, ok := err.(*apierrors.StatusError)
+
+		if ok && sErr.ErrStatus.Code == 422 && sErr.ErrStatus.Reason == metav1.StatusReasonInvalid {
+			c.metrics.StsDeleteCreateCounter().Inc()
+
+			// Gather only reason for failed update
+			failMsg := make([]string, len(sErr.ErrStatus.Details.Causes))
+			for i, cause := range sErr.ErrStatus.Details.Causes {
+				failMsg[i] = cause.Message
+			}
+
+			level.Info(logger).Log("msg", "recreating StatefulSet because the update operation wasn't possible", "reason", strings.Join(failMsg, ", "))
+
+			propagationPolicy := metav1.DeletePropagationForeground
+			if err := ssetClient.Delete(ctx, sset.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil {
+				return fmt.Errorf("failed to delete StatefulSet to avoid forbidden action: %w", err)
+			}
+			continue
+		}
+
+		if err != nil {
+			return fmt.Errorf("updating StatefulSet failed: %w", err)
+		}
+	}
+
+	ssets := map[string]struct{}{}
+	for _, ssetName := range expected {
+		ssets[ssetName] = struct{}{}
+	}
+
+	err = c.ssetInfs.ListAllByNamespace(p.Namespace, labels.SelectorFromSet(labels.Set{prompkg.PrometheusNameLabelName: p.Name, prompkg.PrometheusModeLabeLName: prometheusMode}), func(obj interface{}) {
+		s := obj.(*appsv1.StatefulSet)
+
+		if _, ok := ssets[s.Name]; ok {
+			// Do not delete statefulsets that we still expect to exist. This
+			// is to cleanup StatefulSets when shards are reduced.
+			return
+		}
+
+		if c.rr.DeletionInProgress(s) {
+			return
+		}
+
+		propagationPolicy := metav1.DeletePropagationForeground
+		if err := ssetClient.Delete(ctx, s.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil {
+			level.Error(c.logger).Log("err", err, "name", s.GetName(), "namespace", s.GetNamespace())
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("listing StatefulSet resources failed: %w", err)
+	}
+
+	return nil
+}
+
 func (c *Operator) createOrUpdateConfigurationSecret(ctx context.Context, p *monitoringv1alpha1.PrometheusAgent, cg *prompkg.ConfigGenerator, store *assets.StoreBuilder) error {
 	resourceSelector := prompkg.NewResourceSelector(c.logger, p, store, c.nsMonInf, c.metrics, c.eventRecorder)
 
@@ -817,6 +997,53 @@ func createSSetInputHash(p monitoringv1alpha1.PrometheusAgent, c prompkg.Config,
 	}
 
 	return fmt.Sprintf("%d", hash), nil
+}
+
+func (c *Operator) createOrUpdateConfigurationSecretForDaemonSet(ctx context.Context, p *monitoringv1alpha1.PrometheusAgent, cg *prompkg.ConfigGenerator, store *assets.StoreBuilder) error {
+	resourceSelector := prompkg.NewResourceSelector(c.logger, p, store, c.nsMonInf, c.metrics, c.eventRecorder)
+
+	pmons, err := resourceSelector.SelectPodMonitors(ctx, c.pmonInfs.ListAllByNamespace)
+	if err != nil {
+		return fmt.Errorf("selecting PodMonitors failed: %w", err)
+	}
+
+	if err := prompkg.AddRemoteWritesToStore(ctx, store, p.GetNamespace(), p.Spec.RemoteWrite); err != nil {
+		return err
+	}
+
+	if err := prompkg.AddAPIServerConfigToStore(ctx, store, p.GetNamespace(), p.Spec.APIServerConfig); err != nil {
+		return err
+	}
+
+	if err := prompkg.AddScrapeClassesToStore(ctx, store, p.GetNamespace(), p.Spec.ScrapeClasses); err != nil {
+		return fmt.Errorf("failed to process scrape classes: %w", err)
+	}
+
+	sClient := c.kclient.CoreV1().Secrets(p.Namespace)
+	additionalScrapeConfigs, err := k8sutil.LoadSecretRef(ctx, c.logger, sClient, p.Spec.AdditionalScrapeConfigs)
+	if err != nil {
+		return fmt.Errorf("loading additional scrape configs from Secret failed: %w", err)
+	}
+
+	// Update secret based on the most recent configuration.
+	conf, err := cg.GenerateAgentDaemonSetConfiguration(
+		ctx,
+		pmons,
+		store,
+		additionalScrapeConfigs,
+	)
+	if err != nil {
+		return fmt.Errorf("generating config failed: %w", err)
+	}
+
+	// Compress config to avoid 1mb secret limit for a while
+	s, err := prompkg.MakeConfigurationSecret(p, c.config, conf)
+	if err != nil {
+		return fmt.Errorf("creating compressed secret failed: %w", err)
+	}
+
+	level.Debug(c.logger).Log("msg", "updating Prometheus configuration secret")
+	return k8sutil.CreateOrUpdateSecret(ctx, sClient, s)
 }
 
 // UpdateStatus updates the status subresource of the object identified by the given
