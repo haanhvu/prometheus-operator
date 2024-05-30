@@ -269,7 +269,7 @@ func makeStatefulSetSpec(
 	// so forces us to enter the 'recreate cycle' and can potentially lead to downtime.
 	// The requirement to make a change here should be carefully evaluated.
 	podSelectorLabels := makeSelectorLabels(p.GetObjectMeta().GetName())
-	podSelectorLabels[prompkg.ShardLabelName] = fmt.Sprintf("%d", shard)
+	podSelectorLabels[prompkg.ShardLabelName] = fmt.Sprintf("%d", shard) // DaemonSet: Not need
 
 	for k, v := range podSelectorLabels {
 		podLabels[k] = v
@@ -288,7 +288,7 @@ func makeStatefulSetSpec(
 	}
 
 	operatorInitContainers = append(operatorInitContainers,
-		prompkg.BuildConfigReloader(
+		prompkg.BuildConfigReloader( // DaemonSet: Need to edit (add node name env,...)
 			p,
 			c,
 			true,
@@ -330,7 +330,7 @@ func makeStatefulSetSpec(
 				},
 			},
 		},
-		prompkg.BuildConfigReloader(
+		prompkg.BuildConfigReloader( // DaemonSet: Same as previous comment
 			p,
 			c,
 			false,
@@ -348,7 +348,7 @@ func makeStatefulSetSpec(
 
 	// PodManagementPolicy is set to Parallel to mitigate issues in kubernetes: https://github.com/kubernetes/kubernetes/issues/60164
 	// This is also mentioned as one of limitations of StatefulSets: https://kubernetes.io/docs/concepts/workloads/controllers/statefulset/#limitations
-	return &appsv1.StatefulSetSpec{
+	return &appsv1.StatefulSetSpec{ // DaemonSet: Change to DaemonSetSpec, Read the comment above and see if it applies to DaemonSet or not
 		ServiceName:         governingServiceName,
 		Replicas:            cpf.Replicas,
 		PodManagementPolicy: appsv1.ParallelPodManagement,

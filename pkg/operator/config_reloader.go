@@ -35,6 +35,10 @@ const (
 	// PodNameEnvVar is the name of the environment variable injected in the
 	// config-reloader container that contains the pod name.
 	PodNameEnvVar = "POD_NAME"
+
+	// NodeNameEnvVar is the name of the environment variable injected in the
+	// config-reloader container that contains the node name.
+	NodeNameEnvVar = "NODE_NAME"
 )
 
 // ConfigReloader contains the options to configure
@@ -190,6 +194,118 @@ func CreateConfigReloader(name string, options ...ReloaderOption) v1.Container {
 					FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.name"},
 				},
 			},
+		}
+		ports []v1.ContainerPort
+	)
+
+	if configReloader.runOnce {
+		args = append(args, fmt.Sprintf("--watch-interval=%d", 0))
+	}
+
+	if configReloader.listenLocal {
+		args = append(args, fmt.Sprintf("--listen-address=%s:%d", configReloader.localHost, configReloaderPort))
+	} else {
+		args = append(args, fmt.Sprintf("--listen-address=:%d", configReloaderPort))
+		ports = append(
+			ports,
+			v1.ContainerPort{
+				Name:          "reloader-web",
+				ContainerPort: configReloaderPort,
+				Protocol:      v1.ProtocolTCP,
+			},
+		)
+	}
+
+	if len(configReloader.webConfigFile) > 0 {
+		args = append(args, fmt.Sprintf("--web-config-file=%s", configReloader.webConfigFile))
+	}
+
+	if configReloader.useSignal {
+		args = append(args, "--reload-method=signal")
+		if len(configReloader.runtimeInfoURL.String()) > 0 {
+			args = append(args, fmt.Sprintf("--runtimeinfo-url=%s", configReloader.runtimeInfoURL.String()))
+		}
+	} else {
+		// Don't set the --reload-method argument in case the operator is
+		// configured with an older version of the config reloader.
+		if len(configReloader.reloadURL.String()) > 0 {
+			args = append(args, fmt.Sprintf("--reload-url=%s", configReloader.reloadURL.String()))
+		}
+	}
+
+	if len(configReloader.configFile) > 0 {
+		args = append(args, fmt.Sprintf("--config-file=%s", configReloader.configFile))
+	}
+
+	if len(configReloader.configEnvsubstFile) > 0 {
+		args = append(args, fmt.Sprintf("--config-envsubst-file=%s", configReloader.configEnvsubstFile))
+	}
+
+	if len(configReloader.watchedDirectories) > 0 {
+		for _, directory := range configReloader.watchedDirectories {
+			args = append(args, fmt.Sprintf("--watched-dir=%s", directory))
+		}
+	}
+
+	if configReloader.logLevel != "" && configReloader.logLevel != "info" {
+		args = append(args, fmt.Sprintf("--log-level=%s", configReloader.logLevel))
+	}
+
+	if configReloader.logFormat != "" && configReloader.logFormat != "logfmt" {
+		args = append(args, fmt.Sprintf("--log-format=%s", configReloader.logFormat))
+	}
+
+	if configReloader.shard != nil {
+		envVars = append(envVars, v1.EnvVar{
+			Name:  ShardEnvVar,
+			Value: strconv.Itoa(int(*configReloader.shard)),
+		})
+	}
+
+	c := v1.Container{
+		Name:                     name,
+		Image:                    configReloader.config.Image,
+		ImagePullPolicy:          configReloader.imagePullPolicy,
+		TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
+		Env:                      envVars,
+		Command:                  []string{"/bin/prometheus-config-reloader"},
+		Args:                     args,
+		Ports:                    ports,
+		VolumeMounts:             configReloader.volumeMounts,
+		Resources:                configReloader.config.ResourceRequirements(),
+		SecurityContext: &v1.SecurityContext{
+			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
+			Capabilities: &v1.Capabilities{
+				Drop: []v1.Capability{"ALL"},
+			},
+		},
+	}
+
+	if !configReloader.runOnce && configReloader.config.EnableProbes {
+		c = addProbes(c)
+	}
+
+	return c
+}
+
+func CreateConfigReloaderForDaemonSet(name string, options ...ReloaderOption) v1.Container {
+	configReloader := ConfigReloader{name: name}
+
+	for _, option := range options {
+		option(&configReloader)
+	}
+
+	var (
+		args    = make([]string, 0)
+		envVars = []v1.EnvVar{
+			{
+				Name: PodNameEnvVar,
+				ValueFrom: &v1.EnvVarSource{
+					FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.name"},
+				},
+				Name: NodeNameEnvVar,
+				ValueFrom:
 		}
 		ports []v1.ContainerPort
 	)
