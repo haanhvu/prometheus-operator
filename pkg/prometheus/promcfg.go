@@ -2921,6 +2921,7 @@ func (cg *ConfigGenerator) GenerateAgentConfiguration(
 // GenerateAgentConfiguration creates a serialized YAML representation of a Prometheus Agent configuration using the provided resources.
 func (cg *ConfigGenerator) GenerateAgentDaemonSetConfiguration(
 	pMons map[string]*monitoringv1.PodMonitor,
+	tsdb *monitoringv1.TSDBSpec,
 	store *assets.StoreBuilder,
 	additionalScrapeConfigs []byte,
 ) ([]byte, error) {
@@ -2958,6 +2959,18 @@ func (cg *ConfigGenerator) GenerateAgentDaemonSetConfiguration(
 		Key:   "scrape_configs",
 		Value: scrapeConfigs,
 	})
+
+	// TSDB
+	if tsdb != nil && tsdb.OutOfOrderTimeWindow != "" {
+		var storage yaml.MapSlice
+		storage = cg.AppendMapItem(storage, "tsdb", yaml.MapSlice{
+			{
+				Key:   "out_of_order_time_window",
+				Value: tsdb.OutOfOrderTimeWindow,
+			},
+		})
+		cfg = cg.WithMinimumVersion("2.54.0").AppendMapItem(cfg, "storage", storage)
+	}
 
 	// Remote write config
 	if len(cpf.RemoteWrite) > 0 {
