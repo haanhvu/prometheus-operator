@@ -18,6 +18,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"reflect"
 	"regexp"
@@ -1164,7 +1165,30 @@ func (cg *ConfigGenerator) generatePodMonitorConfigForAgentDaemonSet(
 
 	s := store.ForNamespace(m.Namespace)
 
-	cfg = append(cfg, cg.generateK8SSDConfig(m.Spec.NamespaceSelector, m.Namespace, apiserverConfig, s, kubernetesSDRolePod, attachMetaConfig))
+	k8SSDConfig := cg.generateK8SSDConfig(m.Spec.NamespaceSelector, m.Namespace, apiserverConfig, s, kubernetesSDRolePod, attachMetaConfig)
+	k8SSDConfigValue := k8SSDConfig.Value.([]yaml.MapSlice)
+	k8SSDConfigValue = append(k8SSDConfigValue, yaml.MapSlice{
+		{
+			Key:   "role",
+			Value: "pod",
+		},
+		{
+			Key: "selectors",
+			Value: yaml.MapSlice{
+				{
+					Key:   "role",
+					Value: "pod",
+				},
+				{
+					Key:   "field",
+					Value: "spec.nodeName=" + os.Getenv("NODE_NAME"),
+				},
+			},
+		},
+	})
+	k8SSDConfig.Value = k8SSDConfigValue
+
+	cfg = append(cfg, k8SSDConfig)
 
 	if ep.Interval != "" {
 		cfg = append(cfg, yaml.MapItem{Key: "scrape_interval", Value: ep.Interval})
@@ -2228,7 +2252,7 @@ func (cg *ConfigGenerator) generateAdditionalScrapeConfigs(
 	return addlScrapeConfigs, nil
 }
 
-// Should DaemonSet pod monitor filter be added here instead?
+// DaemonSet: Should DaemonSet pod monitor filter be added here instead?
 func (cg *ConfigGenerator) generateAdditionalScrapeConfigsForAgentDaemonSet(
 	additionalScrapeConfigs []byte,
 ) ([]yaml.MapSlice, error) {
