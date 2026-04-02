@@ -24,6 +24,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -38,6 +39,7 @@ import (
 	eventsv1 "k8s.io/api/events/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	k8sflag "k8s.io/component-base/cli/flag"
@@ -72,15 +74,53 @@ func checkPrerequisites(
 	allowedNamespaces []string,
 	groupVersion schema.GroupVersion,
 	resource string,
+	installWaitingTime time.Duration,
 	attributes ...k8s.ResourceAttribute,
 ) (bool, error) {
-	installed, err := k8s.IsAPIGroupVersionResourceSupported(kclient.Discovery(), groupVersion, resource)
+	var (
+		installed bool
+		err       error
+	)
+
+	installed, err = checkInstalled(kclient, groupVersion, resource)
 	if err != nil {
-		return false, fmt.Errorf("failed to check presence of resource %q (group %q): %w", resource, groupVersion, err)
+		return false, err
+	}
+
+	if installWaitingTime > 0 {
+		/*waitCtx, waitCancel := context.WithTimeout(ctx, installWaitingTime)
+			defer waitCancel()
+
+		WAIT:
+			for !installed {
+				select {
+				case <-waitCtx.Done():
+					break WAIT
+				case <-time.After(time.Second):
+					installed, err = checkInstalled(kclient, groupVersion, resource)
+					if err != nil {
+						return false, err
+					}
+				}
+			}*/
+		err = wait.PollUntilContextTimeout(ctx, time.Second, installWaitingTime, false, func(_ context.Context) (bool, error) {
+			installed, err = checkInstalled(kclient, groupVersion, resource)
+			if err != nil {
+				return false, err
+			}
+			return installed, err
+		})
+		if err != nil {
+			return false, err
+		}
 	}
 
 	if !installed {
-		logger.Warn(fmt.Sprintf("resource %q (group: %q) not installed in the cluster", resource, groupVersion))
+		if installWaitingTime > 0 {
+			logger.Warn(fmt.Sprintf("resource %q (group: %q) not installed in the cluster after %v retry", resource, groupVersion, installWaitingTime))
+		} else {
+			logger.Warn(fmt.Sprintf("resource %q (group: %q) not installed in the cluster", resource, groupVersion))
+		}
 		return false, nil
 	}
 
@@ -97,6 +137,19 @@ func checkPrerequisites(
 	}
 
 	return true, nil
+}
+
+func checkInstalled(
+	kclient kubernetes.Interface,
+	groupVersion schema.GroupVersion,
+	resource string,
+) (bool, error) {
+	installed, err := k8s.IsAPIGroupVersionResourceSupported(kclient.Discovery(), groupVersion, resource)
+	if err != nil {
+		return false, fmt.Errorf("failed to check presence of resource %q (group %q): %w", resource, groupVersion, err)
+	}
+
+	return installed, err
 }
 
 const (
@@ -121,6 +174,9 @@ var (
 
 	disableUnmanagedPrometheusConfiguration bool
 
+	crdInstalledWaitingTime time.Duration
+	crdsWaitToBeInstalled   crdsList
+
 	// Parameters for the kubelet endpoints controller.
 	kubeletObject        string
 	kubeletSelector      operator.LabelSelector
@@ -132,6 +188,28 @@ var (
 
 	featureGates = k8sflag.NewMapStringBool(ptr.To(map[string]bool{}))
 )
+
+type crdsList []string
+
+func (s *crdsList) String() string {
+	return strings.Join(*s, ",")
+}
+
+func (s *crdsList) Set(value string) error {
+	parts := strings.Split(value, ",")
+
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		p = strings.ToLower(p)
+		if slices.Contains([]string{"storageclass", "scrapeconfig", "prometheus", "prometheusagent", "alertmanager", "thanosruler"}, p) {
+			*s = append(*s, p)
+		} else {
+			return fmt.Errorf("Unknown CRD: %q", p)
+		}
+	}
+
+	return nil
+}
 
 func parseFlags(fs *flag.FlagSet) {
 	// Web server settings.
@@ -194,6 +272,8 @@ func parseFlags(fs *flag.FlagSet) {
 
 	fs.Float64Var(&memlimitRatio, "auto-gomemlimit-ratio", defaultMemlimitRatio, "The ratio of reserved GOMEMLIMIT memory to the detected maximum container or system memory. The value should be greater than 0.0 and less than 1.0. Default: 0.0 (disabled).")
 	fs.BoolVar(&disableUnmanagedPrometheusConfiguration, "disable-unmanaged-prometheus-configuration", false, "Disable support for unmanaged Prometheus configuration when all resource selectors are nil. As stated in the API documentation, unmanaged Prometheus configuration is a deprecated feature which can be avoided with '.spec.additionalScrapeConfigs' or the ScrapeConfig CRD. Default: false.")
+	fs.DurationVar(&crdInstalledWaitingTime, "crd-installed-waiting-time", 0, "The waiting time for a CRD to be installed. During this time, the operator checks every second whether the CRD is installed. Need to set together with --crds-wait-to-be-installed for the operator to know what CRDs to wait for.")
+	fs.Var(&crdsWaitToBeInstalled, "crds-wait-to-be-installed", "CRDs for the operator to wait to be installed. Any of StorageClass, ScrapeConfig, Prometheus, PrometheusAgent, Alertmanager, Thanosruler. Need to be set with crd-installed-waiting-time.")
 	cfg.RegisterFeatureGatesFlags(fs, featureGates)
 
 	logging.RegisterFlags(fs, &logConfig)
@@ -353,6 +433,18 @@ func start() int {
 		logger.Info("Disabling support for unmanaged Prometheus configurations")
 		promControllerOptions = append(promControllerOptions, prometheuscontroller.WithoutUnmanagedConfiguration())
 	}
+
+	if crdInstalledWaitingTime > 0 && crdsWaitToBeInstalled == nil {
+		logger.Error("crd-installed-waiting-time command line argument is set but crds-wait-to-be-installed is not. Need to be set together")
+		cancel()
+		return 1
+	}
+
+	var storageClassInstallWaitTime time.Duration
+	if crdInstalledWaitingTime > 0 && slices.Contains(crdsWaitToBeInstalled, "storageclass") {
+		storageClassInstallWaitTime = crdInstalledWaitingTime
+	}
+
 	// Check if we can read the storage classs
 	canReadStorageClass, err := checkPrerequisites(
 		ctx,
@@ -361,6 +453,7 @@ func start() int {
 		nil,
 		storagev1.SchemeGroupVersion,
 		storagev1.SchemeGroupVersion.WithResource("storageclasses").Resource,
+		storageClassInstallWaitTime,
 		k8s.ResourceAttribute{
 			Group:    storagev1.GroupName,
 			Version:  storagev1.SchemeGroupVersion.Version,
@@ -400,6 +493,11 @@ func start() int {
 	}
 	cfg.EventRecorderFactory = operator.NewEventRecorderFactory(canEmitEvents)
 
+	var scrapeConfigInstallWaitTime time.Duration
+	if crdInstalledWaitingTime > 0 && slices.Contains(crdsWaitToBeInstalled, "scrapeconfig") {
+		scrapeConfigInstallWaitTime = crdInstalledWaitingTime
+	}
+
 	scrapeConfigSupported, err := checkPrerequisites(
 		ctx,
 		logger,
@@ -407,6 +505,7 @@ func start() int {
 		cfg.Namespaces.AllowList.Slice(),
 		monitoringv1alpha1.SchemeGroupVersion,
 		monitoringv1alpha1.ScrapeConfigName,
+		scrapeConfigInstallWaitTime,
 		k8s.ResourceAttribute{
 			Group:    monitoring.GroupName,
 			Version:  monitoringv1alpha1.Version,
@@ -432,6 +531,11 @@ func start() int {
 		promAgentControllerOptions = append(promAgentControllerOptions, prometheusagentcontroller.WithEndpointSlice())
 	}
 
+	var prometheusInstallWaitTime time.Duration
+	if crdInstalledWaitingTime > 0 && slices.Contains(crdsWaitToBeInstalled, "prometheus") {
+		prometheusInstallWaitTime = crdInstalledWaitingTime
+	}
+
 	prometheusSupported, err := checkPrerequisites(
 		ctx,
 		logger,
@@ -439,6 +543,7 @@ func start() int {
 		cfg.Namespaces.PrometheusAllowList.Slice(),
 		monitoringv1.SchemeGroupVersion,
 		monitoringv1.PrometheusName,
+		prometheusInstallWaitTime,
 		k8s.ResourceAttribute{
 			Group:    monitoring.GroupName,
 			Version:  monitoringv1.Version,
@@ -487,6 +592,11 @@ func start() int {
 		}
 	}
 
+	var prometheusAgentInstallWaitTime time.Duration
+	if crdInstalledWaitingTime > 0 && slices.Contains(crdsWaitToBeInstalled, "prometheusagent") {
+		prometheusAgentInstallWaitTime = crdInstalledWaitingTime
+	}
+
 	prometheusAgentSupported, err := checkPrerequisites(
 		ctx,
 		logger,
@@ -494,6 +604,7 @@ func start() int {
 		cfg.Namespaces.PrometheusAllowList.Slice(),
 		monitoringv1alpha1.SchemeGroupVersion,
 		monitoringv1alpha1.PrometheusAgentName,
+		prometheusAgentInstallWaitTime,
 		k8s.ResourceAttribute{
 			Group:    monitoring.GroupName,
 			Version:  monitoringv1alpha1.Version,
@@ -567,6 +678,11 @@ func start() int {
 		}
 	}
 
+	var alertmanagerInstallWaitTime time.Duration
+	if crdInstalledWaitingTime > 0 && slices.Contains(crdsWaitToBeInstalled, "alertmanager") {
+		alertmanagerInstallWaitTime = crdInstalledWaitingTime
+	}
+
 	alertmanagerSupported, err := checkPrerequisites(
 		ctx,
 		logger,
@@ -574,6 +690,7 @@ func start() int {
 		cfg.Namespaces.AlertmanagerAllowList.Slice(),
 		monitoringv1.SchemeGroupVersion,
 		monitoringv1.AlertmanagerName,
+		alertmanagerInstallWaitTime,
 		k8s.ResourceAttribute{
 			Group:    monitoring.GroupName,
 			Version:  monitoringv1.Version,
@@ -608,6 +725,11 @@ func start() int {
 		}
 	}
 
+	var thanosrulerInstallWaitTime time.Duration
+	if crdInstalledWaitingTime > 0 && slices.Contains(crdsWaitToBeInstalled, "thanosruler") {
+		thanosrulerInstallWaitTime = crdInstalledWaitingTime
+	}
+
 	thanosRulerSupported, err := checkPrerequisites(
 		ctx,
 		logger,
@@ -615,6 +737,7 @@ func start() int {
 		cfg.Namespaces.ThanosRulerAllowList.Slice(),
 		monitoringv1.SchemeGroupVersion,
 		monitoringv1.ThanosRulerName,
+		thanosrulerInstallWaitTime,
 		k8s.ResourceAttribute{
 			Group:    monitoring.GroupName,
 			Version:  monitoringv1.Version,
