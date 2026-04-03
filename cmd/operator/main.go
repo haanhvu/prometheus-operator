@@ -103,13 +103,7 @@ func checkPrerequisites(
 					}
 				}
 			}*/
-		err = wait.PollUntilContextTimeout(ctx, time.Second, installWaitingTime, false, func(_ context.Context) (bool, error) {
-			installed, err = checkInstalled(kclient, groupVersion, resource)
-			if err != nil {
-				return false, err
-			}
-			return installed, err
-		})
+		installed, err = checkInstalledWithTimeout(ctx, kclient, groupVersion, resource, installWaitingTime)
 		if err != nil {
 			return false, err
 		}
@@ -137,6 +131,27 @@ func checkPrerequisites(
 	}
 
 	return true, nil
+}
+
+func checkInstalledWithTimeout(
+	ctx context.Context,
+	kclient kubernetes.Interface,
+	groupVersion schema.GroupVersion,
+	resource string,
+	installWaitingTime time.Duration,
+) (bool, error) {
+	var (
+		installed bool
+		realErr   error
+	)
+
+	_ = wait.PollUntilContextTimeout(ctx, time.Second, installWaitingTime, false, func(_ context.Context) (bool, error) {
+		installed, realErr = checkInstalled(kclient, groupVersion, resource)
+
+		return installed, realErr
+	})
+
+	return installed, realErr
 }
 
 func checkInstalled(
