@@ -21,15 +21,67 @@ import (
 
 	"github.com/stretchr/testify/require"
 	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/client-go/kubernetes/fake"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes"
 )
+
+var runs = 0
+
+type mockKubernetesClient struct {
+	kubernetes.Interface
+	discovery discovery.DiscoveryInterface
+}
+
+func newMockKubernetesClient() kubernetes.Interface {
+	return &mockKubernetesClient{
+		discovery: &mockDiscoveryClient{},
+	}
+}
+
+func (m *mockKubernetesClient) Discovery() discovery.DiscoveryInterface {
+	return m.discovery
+}
+
+type mockDiscoveryClient struct {
+	discovery.DiscoveryInterface
+}
+
+func (m *mockDiscoveryClient) ServerResourcesForGroupVersion(_ string) (*metav1.APIResourceList, error) {
+	time.Sleep(10 * time.Second)
+
+	runs++
+
+	if runs >= 3 {
+		return &metav1.APIResourceList{
+			APIResources: []metav1.APIResource{
+				metav1.APIResource{
+					Name: "test",
+				},
+			},
+		}, nil
+	}
+
+	return &metav1.APIResourceList{
+		APIResources: []metav1.APIResource{
+			metav1.APIResource{
+				Name: "fail",
+			},
+		},
+	}, nil
+}
 
 func TestWaitForCRDInstalled(t *testing.T) {
 	ctx := context.Background()
-	client := fake.NewClientset()
+	client := newMockKubernetesClient()
 
-	installed, err := checkInstalledWithTimeout(ctx, client, storagev1.SchemeGroupVersion, "storageclasses", 5*time.Second)
+	installed, err := checkInstalledWithTimeout(ctx, client, storagev1.SchemeGroupVersion, "test", 5*time.Second)
 	require.NoError(t, err)
-	// Will be false because fake client has no resources registered by default
+	require.Equal(t, runs, 1)
 	require.False(t, installed)
+
+	installed, err = checkInstalledWithTimeout(ctx, client, storagev1.SchemeGroupVersion, "test", 50*time.Second)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, runs, 3)
+	require.True(t, installed)
 }

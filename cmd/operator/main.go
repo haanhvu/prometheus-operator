@@ -88,21 +88,6 @@ func checkPrerequisites(
 	}
 
 	if installWaitingTime > 0 {
-		/*waitCtx, waitCancel := context.WithTimeout(ctx, installWaitingTime)
-			defer waitCancel()
-
-		WAIT:
-			for !installed {
-				select {
-				case <-waitCtx.Done():
-					break WAIT
-				case <-time.After(time.Second):
-					installed, err = checkInstalled(kclient, groupVersion, resource)
-					if err != nil {
-						return false, err
-					}
-				}
-			}*/
 		installed, err = checkInstalledWithTimeout(ctx, kclient, groupVersion, resource, installWaitingTime)
 		if err != nil {
 			return false, err
